@@ -20,7 +20,7 @@ interface StoredKeys {
 const DB_NAME = 'mesez_keys';
 const KEY_STORE_NAME = 'userKeys';
 const MSG_STORE_NAME = 'messages';
-const DB_VERSION = 2;
+const DB_VERSION = 3;
 
 export function normalizeUsername(value: string): string {
     return (value || '').trim().toLowerCase();
@@ -49,7 +49,8 @@ function initDB(): Promise<IDBDatabase> {
                 db.createObjectStore(KEY_STORE_NAME, { keyPath: 'username' });
             }
             if (!db.objectStoreNames.contains(MSG_STORE_NAME)) {
-                const msgStore = db.createObjectStore(MSG_STORE_NAME, { keyPath: 'id' });
+                // Key by owner+message id to keep message records isolated per logged-in user.
+                const msgStore = db.createObjectStore(MSG_STORE_NAME, { keyPath: 'storageKey' });
                 msgStore.createIndex('owner', 'owner', { unique: false });
                 msgStore.createIndex('chatPartner', 'chatPartner', { unique: false });
                 msgStore.createIndex('ownerKey', 'ownerKey', { unique: false });
@@ -61,6 +62,12 @@ function initDB(): Promise<IDBDatabase> {
                 }
                 if (!msgStore.indexNames.contains('chatPartnerKey')) {
                     msgStore.createIndex('chatPartnerKey', 'chatPartnerKey', { unique: false });
+                }
+                if (!msgStore.indexNames.contains('owner')) {
+                    msgStore.createIndex('owner', 'owner', { unique: false });
+                }
+                if (!msgStore.indexNames.contains('chatPartner')) {
+                    msgStore.createIndex('chatPartner', 'chatPartner', { unique: false });
                 }
             }
         };
@@ -274,8 +281,15 @@ export async function saveMessageLocally(owner: string, message: any): Promise<v
         const chatPartner = isSentByOwner ? recipient : sender;
         const chatPartnerKey = normalizeUsername(chatPartner);
 
+        const messageId = typeof message.id === 'string' ? message.id.trim() : '';
+        if (!messageId) {
+            return;
+        }
+
         const entry = {
             ...message,
+            id: messageId,
+            storageKey: `${ownerKey}::${messageId}`,
             owner,
             ownerKey,
             chatPartner,

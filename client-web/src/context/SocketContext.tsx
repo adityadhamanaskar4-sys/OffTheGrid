@@ -61,10 +61,14 @@ const SERVER_URL = (import.meta.env.VITE_SERVER_URL as string) || 'http://localh
 
 // Map server message format to client format
 function mapServerMessage(msg: any): Message {
+    const from = typeof msg?.from === 'string' ? msg.from : '';
+    const to = typeof msg?.to === 'string' ? msg.to : '';
+    const id = typeof msg?.id === 'string' ? msg.id : '';
+
     return {
-        id: msg.id,
-        from: msg.sender_username || msg.sender || msg.from,
-        to: msg.recipient_username || msg.recipient || msg.to,
+        id,
+        from,
+        to,
         content: msg.content,
         timestamp: msg.timestamp,
         status: msg.status,
@@ -367,6 +371,20 @@ export const SocketProvider: React.FC<{ children: ReactNode }> = ({ children }) 
         const onDirectMessage = async (msg: any) => {
             console.log('[Socket] Received message raw:', msg);
             const mapped = mapServerMessage(msg);
+            const currentUserKey = normalizeUsername(user.username);
+            const fromKey = normalizeUsername(mapped.from);
+            const toKey = normalizeUsername(mapped.to);
+
+            if (!mapped.id || !mapped.timestamp || !fromKey || !toKey) {
+                console.warn('[Socket] Ignoring malformed direct message payload');
+                return;
+            }
+
+            // Process only messages where this user is a participant.
+            if (toKey !== currentUserKey && fromKey !== currentUserKey) {
+                console.warn('[Socket] Ignoring message not addressed to current user');
+                return;
+            }
 
             // Decrypt message if encrypted
             if (mapped.encrypted && mapped.iv) {
@@ -429,11 +447,9 @@ export const SocketProvider: React.FC<{ children: ReactNode }> = ({ children }) 
         };
 
         socket.on('direct_message', onDirectMessage);
-        socket.on('message', onDirectMessage);
 
         return () => {
             socket.off('direct_message', onDirectMessage);
-            socket.off('message', onDirectMessage);
         };
     }, [socket, user, requestUserPublicKeys, loadInbox]);
 
