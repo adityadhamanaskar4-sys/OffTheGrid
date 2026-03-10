@@ -9,5 +9,12 @@ contextBridge.exposeInMainWorld('electron', {
     readDir: (dirPath: string) => ipcRenderer.invoke('fs-read-dir', dirPath),
     ensureDir: (dirPath: string) => ipcRenderer.invoke('fs-ensure-dir', dirPath),
     access: (filePath: string) => ipcRenderer.invoke('fs-access', filePath)
+  },
+  crypto: {
+    generateKeyPairs: () => ipcRenderer.invoke('crypto-generate-key-pairs'),
+    encryptMessage: (message: string, recipientPublicKey: string, senderPrivateKey: string) =>
+      ipcRenderer.invoke('crypto-encrypt-message', { message, recipientPublicKey, senderPrivateKey }),
+    decryptMessage: (encryptedContent: string, iv: string, senderPublicKey: string, recipientPrivateKey: string) =>
+      ipcRenderer.invoke('crypto-decrypt-message', { encryptedContent, iv, senderPublicKey, recipientPrivateKey })
   }
 });

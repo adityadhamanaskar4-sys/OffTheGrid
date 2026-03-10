@@ -38,6 +38,28 @@ declare global {
                 ensureDir: (dirPath: string) => Promise<{ success: boolean; error?: string }>;
                 access: (filePath: string) => Promise<{ success: boolean; error?: string }>;
             };
+            crypto?: {
+                generateKeyPairs: () => Promise<{
+                    success: boolean;
+                    keys?: {
+                        signing: StoredKeyPair;
+                        encryption: StoredKeyPair;
+                        format: string;
+                    };
+                    error?: string;
+                }>;
+                encryptMessage: (
+                    message: string,
+                    recipientPublicKey: string,
+                    senderPrivateKey: string
+                ) => Promise<{ success: boolean; encryptedContent?: string; iv?: string; error?: string }>;
+                decryptMessage: (
+                    encryptedContent: string,
+                    iv: string,
+                    senderPublicKey: string,
+                    recipientPrivateKey: string
+                ) => Promise<{ success: boolean; content?: string; error?: string }>;
+            };
         };
     }
 }
@@ -63,15 +85,49 @@ export function normalizeUsername(value: string): string {
     return (value || '').trim().toLowerCase();
 }
 
+const LOCAL_KEYS_PREFIX = 'otg_keys_';
+const LOCAL_MESSAGES_PREFIX = 'otg_msgs_';
+
+function hasElectronApi(): boolean {
+    return typeof window !== 'undefined' && !!window.electron;
+}
+
+function getLocalKeysStorageKey(username: string): string {
+    return `${LOCAL_KEYS_PREFIX}${normalizeUsername(username)}`;
+}
+
+function getLocalMessagesStorageKey(owner: string, contact: string): string {
+    return `${LOCAL_MESSAGES_PREFIX}${normalizeUsername(owner)}_${normalizeUsername(contact)}`;
+}
+
+function readLocalJson<T>(key: string): T | null {
+    try {
+        const raw = localStorage.getItem(key);
+        if (!raw) return null;
+        return JSON.parse(raw) as T;
+    } catch (err) {
+        console.error('Failed to read localStorage JSON:', err);
+        return null;
+    }
+}
+
+function writeLocalJson<T>(key: string, value: T): void {
+    try {
+        localStorage.setItem(key, JSON.stringify(value));
+    } catch (err) {
+        console.error('Failed to write localStorage JSON:', err);
+    }
+}
+
 /**
  * Ensure directory exists
  */
 async function ensureDir(dirPath: string): Promise<void> {
-    if (!window.electron) {
-        throw new Error('Electron API not available');
+    if (!hasElectronApi()) {
+        return;
     }
     
-    const result = await window.electron.fs.ensureDir(dirPath);
+    const result = await window.electron!.fs.ensureDir(dirPath);
     if (!result.success) {
         throw new Error(result.error || 'Failed to create directory');
     }
@@ -170,21 +226,40 @@ export async function generateAndStoreKeys(username: string): Promise<PublicKeys
         throw new Error('Username is required for key generation');
     }
 
-    if (!window.electron) {
-        throw new Error('Electron API not available');
+    let signingPublicKey = '';
+    let signingPrivateKey = '';
+    let encryptionPublicKey = '';
+    let encryptionPrivateKey = '';
+    let keyFormat = 'spki-pkcs8-base64';
+
+    try {
+        const { signing, encryption } = await generateKeyPair();
+        signingPublicKey = await exportKeyToBase64(signing.publicKey, 'public');
+        signingPrivateKey = await exportKeyToBase64(signing.privateKey, 'private');
+        encryptionPublicKey = await exportKeyToBase64(encryption.publicKey, 'public');
+        encryptionPrivateKey = await exportKeyToBase64(encryption.privateKey, 'private');
+    } catch (err) {
+        console.warn('WebCrypto key generation failed, trying Electron crypto fallback:', err);
+        if (!hasElectronApi() || !window.electron?.crypto?.generateKeyPairs) {
+            throw err;
+        }
+
+        const response = await window.electron.crypto.generateKeyPairs();
+        if (!response.success || !response.keys) {
+            throw new Error(response.error || 'Failed to generate keys via Electron crypto');
+        }
+
+        signingPublicKey = response.keys.signing.publicKey;
+        signingPrivateKey = response.keys.signing.privateKey;
+        encryptionPublicKey = response.keys.encryption.publicKey;
+        encryptionPrivateKey = response.keys.encryption.privateKey;
+        keyFormat = response.keys.format || 'spki-pkcs8-base64';
     }
-
-    const { signing, encryption } = await generateKeyPair();
-
-    const signingPublicKey = await exportKeyToBase64(signing.publicKey, 'public');
-    const signingPrivateKey = await exportKeyToBase64(signing.privateKey, 'private');
-    const encryptionPublicKey = await exportKeyToBase64(encryption.publicKey, 'public');
-    const encryptionPrivateKey = await exportKeyToBase64(encryption.privateKey, 'private');
 
     const payload: StoredKeys = {
         username: normalizedUsername,
         createdAt: new Date().toISOString(),
-        format: 'spki-pkcs8-base64',
+        format: keyFormat,
         signing: {
             publicKey: signingPublicKey,
             privateKey: signingPrivateKey,
@@ -195,19 +270,24 @@ export async function generateAndStoreKeys(username: string): Promise<PublicKeys
         },
     };
 
-    // Store keys in .keys folder
-    try {
-        const keysDir = getKeysDir();
-        await ensureDir(keysDir);
-        
-        const keyFilePath = path.join(keysDir, `${normalizedUsername}.json`);
-        const result = await window.electron.fs.writeFile(keyFilePath, JSON.stringify(payload, null, 2));
-        
-        if (!result.success) {
-            throw new Error(result.error || 'Failed to write key file');
+    if (hasElectronApi()) {
+        // Store keys in .keys folder (Electron)
+        try {
+            const keysDir = getKeysDir();
+            await ensureDir(keysDir);
+            
+            const keyFilePath = path.join(keysDir, `${normalizedUsername}.json`);
+            const result = await window.electron!.fs.writeFile(keyFilePath, JSON.stringify(payload, null, 2));
+            
+            if (!result.success) {
+                throw new Error(result.error || 'Failed to write key file');
+            }
+        } catch (err) {
+            console.warn('Could not store keys in file system:', err);
         }
-    } catch (err) {
-        console.warn('Could not store keys in file system:', err);
+    } else {
+        // Browser fallback for renderer-only runs
+        writeLocalJson(getLocalKeysStorageKey(normalizedUsername), payload);
     }
 
     return {
@@ -226,15 +306,15 @@ export async function loadStoredKeys(username: string): Promise<StoredKeys | nul
         throw new Error('Username is required to load keys');
     }
 
-    if (!window.electron) {
-        throw new Error('Electron API not available');
+    if (!hasElectronApi()) {
+        return readLocalJson<StoredKeys>(getLocalKeysStorageKey(normalizedUsername));
     }
 
     try {
         const keysDir = getKeysDir();
         const keyFilePath = path.join(keysDir, `${normalizedUsername}.json`);
         
-        const result = await window.electron.fs.readFile(keyFilePath);
+        const result = await window.electron!.fs.readFile(keyFilePath);
         if (!result.success || !result.data) {
             return null;
         }
@@ -279,14 +359,7 @@ export async function loadUsableKeys(username: string): Promise<{
  * Save a message locally to the file system
  */
 export async function saveMessageLocally(owner: string, message: any): Promise<void> {
-    if (!window.electron) {
-        throw new Error('Electron API not available');
-    }
-
     try {
-        const messagesDir = getMessagesDir();
-        await ensureDir(messagesDir);
-
         const ownerKey = normalizeUsername(owner);
         const sender = typeof message.from === 'string' ? message.from : '';
         const recipient = typeof message.to === 'string' ? message.to : '';
@@ -304,6 +377,19 @@ export async function saveMessageLocally(owner: string, message: any): Promise<v
             chatPartnerKey
         };
 
+        if (!hasElectronApi()) {
+            const storageKey = getLocalMessagesStorageKey(ownerKey, chatPartnerKey);
+            const existing = readLocalJson<any[]>(storageKey) || [];
+            const deduped = existing.filter((m) => m?.id !== entry.id);
+            deduped.push(entry);
+            deduped.sort((a, b) => new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime());
+            writeLocalJson(storageKey, deduped);
+            return;
+        }
+
+        const messagesDir = getMessagesDir();
+        await ensureDir(messagesDir);
+
         // Create user-specific directory
         const userMessagesDir = path.join(messagesDir, ownerKey);
         await ensureDir(userMessagesDir);
@@ -314,7 +400,7 @@ export async function saveMessageLocally(owner: string, message: any): Promise<v
 
         // Save message as JSON file with message ID as filename
         const messageFilePath = path.join(contactMessagesDir, `${message.id}.json`);
-        const result = await window.electron.fs.writeFile(messageFilePath, JSON.stringify(entry, null, 2));
+        const result = await window.electron!.fs.writeFile(messageFilePath, JSON.stringify(entry, null, 2));
         
         if (!result.success) {
             throw new Error(result.error || 'Failed to save message');
@@ -328,24 +414,28 @@ export async function saveMessageLocally(owner: string, message: any): Promise<v
  * Load local chat history for a contact
  */
 export async function loadLocalHistory(owner: string, contact: string): Promise<any[]> {
-    if (!window.electron) {
-        throw new Error('Electron API not available');
-    }
-
     try {
-        const messagesDir = getMessagesDir();
         const ownerKey = normalizeUsername(owner);
         const contactKey = normalizeUsername(contact);
+
+        if (!hasElectronApi()) {
+            const storageKey = getLocalMessagesStorageKey(ownerKey, contactKey);
+            const messages = readLocalJson<any[]>(storageKey) || [];
+            messages.sort((a, b) => new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime());
+            return messages;
+        }
+
+        const messagesDir = getMessagesDir();
 
         const contactMessagesDir = path.join(messagesDir, ownerKey, contactKey);
         
         // Check if directory exists
-        const accessResult = await window.electron.fs.access(contactMessagesDir);
+        const accessResult = await window.electron!.fs.access(contactMessagesDir);
         if (!accessResult.success) {
             return [];
         }
 
-        const readResult = await window.electron.fs.readDir(contactMessagesDir);
+        const readResult = await window.electron!.fs.readDir(contactMessagesDir);
         if (!readResult.success || !readResult.data) {
             return [];
         }
@@ -355,7 +445,7 @@ export async function loadLocalHistory(owner: string, contact: string): Promise<
         for (const file of readResult.data) {
             if (!file.isDirectory && file.name.endsWith('.json')) {
                 const filePath = path.join(contactMessagesDir, file.name);
-                const fileResult = await window.electron.fs.readFile(filePath);
+                const fileResult = await window.electron!.fs.readFile(filePath);
                 if (fileResult.success && fileResult.data) {
                     messages.push(JSON.parse(fileResult.data));
                 }
@@ -375,22 +465,50 @@ export async function loadLocalHistory(owner: string, contact: string): Promise<
  * Load local inbox
  */
 export async function loadLocalInbox(owner: string): Promise<LocalInboxItem[]> {
-    if (!window.electron) {
-        throw new Error('Electron API not available');
-    }
-
     try {
-        const messagesDir = getMessagesDir();
         const ownerKey = normalizeUsername(owner);
+
+        if (!hasElectronApi()) {
+            const inbox: LocalInboxItem[] = [];
+            const ownerPrefix = `${LOCAL_MESSAGES_PREFIX}${ownerKey}_`;
+
+            for (let i = 0; i < localStorage.length; i += 1) {
+                const storageKey = localStorage.key(i);
+                if (!storageKey || !storageKey.startsWith(ownerPrefix)) {
+                    continue;
+                }
+
+                const messages = readLocalJson<any[]>(storageKey) || [];
+                if (messages.length === 0) {
+                    continue;
+                }
+
+                const latestMessage = messages.reduce((latest, current) => {
+                    return new Date(current.timestamp).getTime() > new Date(latest.timestamp).getTime() ? current : latest;
+                }, messages[0]);
+
+                inbox.push({
+                    contact: latestMessage.chatPartner || '',
+                    last_message_preview: latestMessage.content || '',
+                    last_timestamp: latestMessage.timestamp || new Date(0).toISOString(),
+                    unread_count: 0
+                });
+            }
+
+            inbox.sort((a, b) => new Date(b.last_timestamp).getTime() - new Date(a.last_timestamp).getTime());
+            return inbox;
+        }
+
+        const messagesDir = getMessagesDir();
         const userMessagesDir = path.join(messagesDir, ownerKey);
 
         // Check if directory exists
-        const accessResult = await window.electron.fs.access(userMessagesDir);
+        const accessResult = await window.electron!.fs.access(userMessagesDir);
         if (!accessResult.success) {
             return [];
         }
 
-        const contactDirsResult = await window.electron.fs.readDir(userMessagesDir);
+        const contactDirsResult = await window.electron!.fs.readDir(userMessagesDir);
         if (!contactDirsResult.success || !contactDirsResult.data) {
             return [];
         }
@@ -400,7 +518,7 @@ export async function loadLocalInbox(owner: string): Promise<LocalInboxItem[]> {
         for (const contactDir of contactDirsResult.data) {
             if (contactDir.isDirectory) {
                 const contactMessagesDir = path.join(userMessagesDir, contactDir.name);
-                const filesResult = await window.electron.fs.readDir(contactMessagesDir);
+                const filesResult = await window.electron!.fs.readDir(contactMessagesDir);
                 
                 if (!filesResult.success || !filesResult.data) {
                     continue;
@@ -412,7 +530,7 @@ export async function loadLocalInbox(owner: string): Promise<LocalInboxItem[]> {
                 for (const file of filesResult.data) {
                     if (!file.isDirectory && file.name.endsWith('.json')) {
                         const filePath = path.join(contactMessagesDir, file.name);
-                        const fileResult = await window.electron.fs.readFile(filePath);
+                        const fileResult = await window.electron!.fs.readFile(filePath);
                         
                         if (fileResult.success && fileResult.data) {
                             const message = JSON.parse(fileResult.data);

@@ -48,6 +48,16 @@ export const Chat: React.FC = () => {
     const isContactOnline = (contact: string) =>
         onlineUsers.includes(contact);
 
+    const visibleMessages = activeContact
+        ? messages.filter((msg) => {
+            const active = activeContact.toLowerCase();
+            const from = (msg.from || '').toLowerCase();
+            const to = (msg.to || '').toLowerCase();
+            const me = (user?.username || '').toLowerCase();
+            return (from === me && to === active) || (from === active && to === me);
+        })
+        : [];
+
     return (
         <div className="flex h-screen w-full bg-surface-950 text-white overflow-hidden">
             {/* Sidebar */}
@@ -219,13 +229,13 @@ export const Chat: React.FC = () => {
 
                         {/* Messages */}
                         <div className="flex-1 overflow-y-auto p-6 space-y-3">
-                            {messages.length === 0 && (
+                            {visibleMessages.length === 0 && (
                                 <div className="h-full flex flex-col items-center justify-center text-surface-200/30">
                                     <MessageSquare size={32} className="mb-2" />
                                     <p className="text-sm">No messages yet. Say hello! 👋</p>
                                 </div>
                             )}
-                            {messages.map((msg, i) => {
+                            {visibleMessages.map((msg, i) => {
                                 const isMe = msg.from === user?.username;
                                 return (
                                     <div

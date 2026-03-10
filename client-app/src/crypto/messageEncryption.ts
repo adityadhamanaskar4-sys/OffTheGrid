@@ -7,12 +7,70 @@
  * Converts a base64 string to an ArrayBuffer
  */
 function base64ToArrayBuffer(base64: string): ArrayBuffer {
+    if (typeof base64 !== 'string' || base64.trim().length === 0) {
+        throw new Error('Key material is empty or missing');
+    }
+
     const binary = atob(base64);
     const bytes = new Uint8Array(binary.length);
     for (let i = 0; i < binary.length; i++) {
         bytes[i] = binary.charCodeAt(i);
     }
     return bytes.buffer;
+}
+
+function normalizeBase64Key(rawKey: string): string {
+    return (rawKey || '')
+        .replace(/-----BEGIN[^-]+-----/g, '')
+        .replace(/-----END[^-]+-----/g, '')
+        .replace(/\s+/g, '')
+        .trim();
+}
+
+function isUnsupportedAlgorithmError(err: unknown): boolean {
+    const text = err instanceof Error ? `${err.name} ${err.message}`.toLowerCase() : String(err).toLowerCase();
+    return text.includes('unrecognized') || text.includes('not supported') || text.includes('notsupportederror');
+}
+
+async function encryptWithElectronFallback(
+    message: string,
+    recipientPublicKey: string,
+    senderPrivateKey: string
+): Promise<{ encryptedContent: string; iv: string }> {
+    const result = await window.electron?.crypto?.encryptMessage(
+        message,
+        normalizeBase64Key(recipientPublicKey),
+        normalizeBase64Key(senderPrivateKey)
+    );
+
+    if (!result?.success || !result.encryptedContent || !result.iv) {
+        throw new Error(result?.error || 'Electron crypto encryption failed');
+    }
+
+    return {
+        encryptedContent: result.encryptedContent,
+        iv: result.iv,
+    };
+}
+
+async function decryptWithElectronFallback(
+    encryptedContent: string,
+    iv: string,
+    senderPublicKey: string,
+    recipientPrivateKey: string
+): Promise<string> {
+    const result = await window.electron?.crypto?.decryptMessage(
+        normalizeBase64Key(encryptedContent),
+        normalizeBase64Key(iv),
+        normalizeBase64Key(senderPublicKey),
+        normalizeBase64Key(recipientPrivateKey)
+    );
+
+    if (!result?.success || typeof result.content !== 'string') {
+        throw new Error(result?.error || 'Electron crypto decryption failed');
+    }
+
+    return result.content;
 }
 
 /**
@@ -36,7 +94,8 @@ async function importKey(
     type: 'public' | 'private',
     algorithm: 'X25519' | 'Ed25519'
 ): Promise<CryptoKey> {
-    const keyData = base64ToArrayBuffer(base64Key);
+    const normalizedKey = normalizeBase64Key(base64Key);
+    const keyData = base64ToArrayBuffer(normalizedKey);
     const format = type === 'public' ? 'spki' : 'pkcs8';
     
     const keyUsages = algorithm === 'X25519' 
@@ -86,33 +145,40 @@ export async function encryptMessage(
     recipientPublicKey: string,
     senderPrivateKey: string
 ): Promise<{ encryptedContent: string; iv: string }> {
-    // Import keys
-    const recipientPubKey = await importKey(recipientPublicKey, 'public', 'X25519');
-    const senderPrivKey = await importKey(senderPrivateKey, 'private', 'X25519');
+    try {
+        // Import keys
+        const recipientPubKey = await importKey(recipientPublicKey, 'public', 'X25519');
+        const senderPrivKey = await importKey(senderPrivateKey, 'private', 'X25519');
 
-    // Derive shared encryption key
-    const sharedKey = await deriveSharedKey(senderPrivKey, recipientPubKey);
+        // Derive shared encryption key
+        const sharedKey = await deriveSharedKey(senderPrivKey, recipientPubKey);
 
-    // Generate random IV
-    const iv = window.crypto.getRandomValues(new Uint8Array(12));
+        // Generate random IV
+        const iv = window.crypto.getRandomValues(new Uint8Array(12));
 
-    // Encrypt message
-    const encoder = new TextEncoder();
-    const messageData = encoder.encode(message);
+        // Encrypt message
+        const encoder = new TextEncoder();
+        const messageData = encoder.encode(message);
 
-    const encryptedData = await window.crypto.subtle.encrypt(
-        {
-            name: 'AES-GCM',
-            iv: iv,
-        },
-        sharedKey,
-        messageData
-    );
+        const encryptedData = await window.crypto.subtle.encrypt(
+            {
+                name: 'AES-GCM',
+                iv: iv,
+            },
+            sharedKey,
+            messageData
+        );
 
-    return {
-        encryptedContent: arrayBufferToBase64(encryptedData),
-        iv: arrayBufferToBase64(iv.buffer),
-    };
+        return {
+            encryptedContent: arrayBufferToBase64(encryptedData),
+            iv: arrayBufferToBase64(iv.buffer),
+        };
+    } catch (err) {
+        if (window.electron?.crypto?.encryptMessage && isUnsupportedAlgorithmError(err)) {
+            return encryptWithElectronFallback(message, recipientPublicKey, senderPrivateKey);
+        }
+        throw err;
+    }
 }
 
 /**
@@ -124,28 +190,35 @@ export async function decryptMessage(
     senderPublicKey: string,
     recipientPrivateKey: string
 ): Promise<string> {
-    // Import keys
-    const senderPubKey = await importKey(senderPublicKey, 'public', 'X25519');
-    const recipientPrivKey = await importKey(recipientPrivateKey, 'private', 'X25519');
+    try {
+        // Import keys
+        const senderPubKey = await importKey(senderPublicKey, 'public', 'X25519');
+        const recipientPrivKey = await importKey(recipientPrivateKey, 'private', 'X25519');
 
-    // Derive shared encryption key
-    const sharedKey = await deriveSharedKey(recipientPrivKey, senderPubKey);
+        // Derive shared encryption key
+        const sharedKey = await deriveSharedKey(recipientPrivKey, senderPubKey);
 
-    // Decrypt message
-    const encryptedData = base64ToArrayBuffer(encryptedContent);
-    const ivData = base64ToArrayBuffer(iv);
+        // Decrypt message
+        const encryptedData = base64ToArrayBuffer(encryptedContent);
+        const ivData = base64ToArrayBuffer(iv);
 
-    const decryptedData = await window.crypto.subtle.decrypt(
-        {
-            name: 'AES-GCM',
-            iv: ivData,
-        },
-        sharedKey,
-        encryptedData
-    );
+        const decryptedData = await window.crypto.subtle.decrypt(
+            {
+                name: 'AES-GCM',
+                iv: ivData,
+            },
+            sharedKey,
+            encryptedData
+        );
 
-    const decoder = new TextDecoder();
-    return decoder.decode(decryptedData);
+        const decoder = new TextDecoder();
+        return decoder.decode(decryptedData);
+    } catch (err) {
+        if (window.electron?.crypto?.decryptMessage && isUnsupportedAlgorithmError(err)) {
+            return decryptWithElectronFallback(encryptedContent, iv, senderPublicKey, recipientPrivateKey);
+        }
+        throw err;
+    }
 }
 
 /**

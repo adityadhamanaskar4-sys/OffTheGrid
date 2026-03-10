@@ -1,4 +1,4 @@
-import React, { createContext, useContext, useEffect, useState, useCallback } from 'react';
+import React, { createContext, useContext, useEffect, useState, useCallback, useRef } from 'react';
 import type { ReactNode } from 'react';
 import { io, Socket } from 'socket.io-client';
 import { v4 as uuidv4 } from 'uuid';
@@ -82,6 +82,7 @@ export const SocketProvider: React.FC<{ children: ReactNode }> = ({ children }) 
     const [inbox, setInbox] = useState<InboxItem[]>([]);
     const [onlineUsers, setOnlineUsers] = useState<string[]>([]);
     const [allContacts, setAllContacts] = useState<string[]>([]);
+    const lastKeySyncRef = useRef<string>('');
 
     const loadInbox = useCallback(async () => {
         if (!user) {
@@ -350,8 +351,7 @@ export const SocketProvider: React.FC<{ children: ReactNode }> = ({ children }) 
                         });
                         console.log('[Key Recovery] New keys generated and uploaded to server.');
                     } else {
-                        console.log('[Key Recovery] Existing keys found. Syncing with server...');
-                        await syncOwnKeysWithServer(savedUsername);
+                        console.log('[Key Recovery] Existing keys found. Waiting for live socket sync...');
                     }
                 } catch (e) {
                     console.error('Failed key sync during recovery:', e);
@@ -374,6 +374,22 @@ export const SocketProvider: React.FC<{ children: ReactNode }> = ({ children }) 
             newSocket.close();
         };
     }, []);
+
+    useEffect(() => {
+        if (!socket || !user || !isConnected) {
+            return;
+        }
+
+        const syncKey = `${socket.id || 'no-socket-id'}:${normalizeUsername(user.username)}`;
+        if (lastKeySyncRef.current === syncKey) {
+            return;
+        }
+
+        lastKeySyncRef.current = syncKey;
+        void syncOwnKeysWithServer(user.username).catch((err) => {
+            console.error('[Key Sync] Failed during connected sync:', err);
+        });
+    }, [socket, user, isConnected, syncOwnKeysWithServer]);
 
     // Effect for handling incoming messages with access to current user state
     useEffect(() => {
@@ -450,7 +466,7 @@ export const SocketProvider: React.FC<{ children: ReactNode }> = ({ children }) 
             socket.off('direct_message', onDirectMessage);
             socket.off('message', onDirectMessage);
         };
-    }, [socket, user, requestUserPublicKeys, loadInbox]);
+    }, [socket, user, requestUserPublicKeys, loadInbox, syncOwnKeysWithServer]);
 
     const login = useCallback((username: string, password: string) => {
         return new Promise<void>((resolve, reject) => {
@@ -555,6 +571,7 @@ export const SocketProvider: React.FC<{ children: ReactNode }> = ({ children }) 
     const logout = useCallback(() => {
         localStorage.removeItem('mesez_token');
         localStorage.removeItem('mesez_username');
+        lastKeySyncRef.current = '';
         setUser(null);
         setMessages([]);
         setInbox([]);
@@ -574,41 +591,52 @@ export const SocketProvider: React.FC<{ children: ReactNode }> = ({ children }) 
         let iv: string | undefined;
         let senderEncryptionPublicKey: string | undefined;
 
-        try {
-            // Load sender's private keys
+        const encryptForRecipient = async () => {
             const myKeys = await loadStoredKeys(user.username);
-            if (!myKeys) {
-                console.error('My keys not found');
-                // Try to regenerate keys if missing? For now just error.
-                alert('Encryption error: Your keys are missing. Please re-login.');
-                return;
+            if (!myKeys?.encryption?.privateKey || !myKeys?.encryption?.publicKey) {
+                throw new Error('Local encryption keys are missing or invalid');
             }
 
-            // Fetch recipient's public keys
             const recipientKeys = await requestUserPublicKeys(to, 5000);
+            const recipientEncryptionKey = recipientKeys?.publicKeys?.encryptionPublicKey;
 
-            if (!recipientKeys?.publicKeys) {
-                console.error(`Public keys for user "${to}" not found.`);
-                // If keys are missing, we cannot send E2EE. 
-                // We should NOT send plain text.
-                alert(`Cannot send message: Public keys for user "${to}" not found. The user may need to log in to generate keys.`);
+            if (!recipientEncryptionKey || typeof recipientEncryptionKey !== 'string') {
+                throw new Error(`Public encryption key for user "${to}" not found`);
+            }
+
+            const encryptionResult = await encryptMessage(
+                content,
+                recipientEncryptionKey,
+                myKeys.encryption.privateKey
+            );
+
+            return {
+                encryptedContent: encryptionResult.encryptedContent,
+                iv: encryptionResult.iv,
+                senderEncryptionPublicKey: myKeys.encryption.publicKey,
+            };
+        };
+
+        try {
+            const encrypted = await encryptForRecipient();
+            encryptedContent = encrypted.encryptedContent;
+            iv = encrypted.iv;
+            senderEncryptionPublicKey = encrypted.senderEncryptionPublicKey;
+        } catch (err) {
+            console.error('Encryption failed (first attempt):', err);
+
+            try {
+                await syncOwnKeysWithServer(user.username);
+                const encrypted = await encryptForRecipient();
+                encryptedContent = encrypted.encryptedContent;
+                iv = encrypted.iv;
+                senderEncryptionPublicKey = encrypted.senderEncryptionPublicKey;
+            } catch (retryErr) {
+                console.error('Encryption failed (retry):', retryErr);
+                const reason = retryErr instanceof Error ? retryErr.message : 'Unknown encryption error';
+                alert(`Failed to encrypt message. Message was NOT sent. (${reason})`);
                 return;
             }
-
-            if (myKeys && recipientKeys?.publicKeys) {
-                const encryptionResult = await encryptMessage(
-                    content,
-                    recipientKeys.publicKeys.encryptionPublicKey,
-                    myKeys.encryption.privateKey
-                );
-                encryptedContent = encryptionResult.encryptedContent;
-                iv = encryptionResult.iv;
-                senderEncryptionPublicKey = myKeys.encryption.publicKey;
-            }
-        } catch (err) {
-            console.error('Encryption failed:', err);
-            alert('Failed to encrypt message. Message was NOT sent.');
-            return;
         }
 
         const msg: Message = {
@@ -644,7 +672,7 @@ export const SocketProvider: React.FC<{ children: ReactNode }> = ({ children }) 
             console.error('Fragmentation failed, using legacy message event:', fragmentError);
             socket.emit('message', msg);
         }
-    }, [socket, user, requestUserPublicKeys, loadInbox]);
+    }, [socket, user, requestUserPublicKeys, loadInbox, syncOwnKeysWithServer]);
 
     return (
         <SocketContext.Provider
